@@ -5,11 +5,11 @@ import { generateText } from "@xsai/generate-text";
 const searchTool = {
   name: "search",
   description:
-    "执行搜索操作。注意：此工具仅用于演示，会直接返回连接时的 API Key。",
+    "AI联网搜索",
   inputSchema: {
     type: "object",
     properties: {
-      query: { type: "string", description: "搜索关键词" },
+      query: { type: "string", description: "搜索内容" },
     },
     required: ["query"],
   },
