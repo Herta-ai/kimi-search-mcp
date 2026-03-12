@@ -1,20 +1,10 @@
 import { tools, handleSearchToolCall } from "./tool";
 
-// --- 类型定义 ---
-
-interface Session {
-  id: string;
-  apiKey: string;
-  model: string;
-  writer: WritableStreamDefaultWriter<Uint8Array> | null;
-}
-
-// 内存存储会话
-const sessions = new Map<string, Session>();
-
-async function processMessage(message: any, session: Session): Promise<any> {
+// 提取处理逻辑为纯函数，不再需要维护内存中的 Session 状态
+async function processMessage(message: any, apiKey: string, model: string): Promise<any> {
   const { method, params, id } = message;
 
+  // 1. 初始化握手
   if (method === "initialize") {
     return {
       jsonrpc: "2.0",
@@ -30,10 +20,12 @@ async function processMessage(message: any, session: Session): Promise<any> {
     };
   }
 
+  // 2. 客户端通知 (不需要返回值)
   if (method === "notifications/initialized") {
-    return null;
+    return null; 
   }
 
+  // 3. 获取工具列表
   if (method === "tools/list") {
     return {
       jsonrpc: "2.0",
@@ -44,6 +36,7 @@ async function processMessage(message: any, session: Session): Promise<any> {
     };
   }
 
+  // 4. 调用工具
   if (method === "tools/call") {
     const { name, arguments: args } = params as {
       name: string;
@@ -54,11 +47,7 @@ async function processMessage(message: any, session: Session): Promise<any> {
         throw new Error(`Unknown tool: ${name}`);
       }
 
-      const result = await handleSearchToolCall(
-        args?.query,
-        session.apiKey,
-        session.model
-      );
+      const result = await handleSearchToolCall(args?.query, apiKey, model);
       return {
         jsonrpc: "2.0",
         id,
@@ -73,23 +62,12 @@ async function processMessage(message: any, session: Session): Promise<any> {
     }
   }
 
+  // 未知方法
   return {
     jsonrpc: "2.0",
     id,
     error: { code: -32601, message: "Method not found" },
   };
-}
-
-// 辅助函数：向 SSE 写入事件
-async function sendSseEvent(
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  event: string,
-  data: any
-) {
-  const encoder = new TextEncoder();
-  const payload = typeof data === "string" ? data : JSON.stringify(data);
-  const message = `event: ${event}\ndata: ${payload}\n\n`;
-  await writer.write(encoder.encode(message));
 }
 
 // --- Bun Server 启动 ---
@@ -101,98 +79,70 @@ export const server = Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // 跨域处理 (MCP Inspector 通常需要跨域)
+    // 跨域处理 (MCP 规范中要求支持特定 Header)
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Headers": "Content-Type, MCP-Session-Id, MCP-Protocol-Version",
         },
       });
     }
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, MCP-Session-Id, MCP-Protocol-Version",
     };
 
-    // 1. 建立 SSE 连接：GET /mcp?apiKey=xxx
-    if (path === "/mcp" && req.method === "GET") {
+    // --- 核心修改：统一使用 /mcp 端点处理所有事情 ---
+    if (path === "/mcp") {
       const apiKey = url.searchParams.get("apiKey");
       if (!apiKey) {
         return new Response("Missing 'apiKey' query parameter", {
           status: 400,
+          headers: corsHeaders,
         });
       }
-
       const model = url.searchParams.get("model") || "kimi-k2-0905-preview";
 
-      const sessionId = crypto.randomUUID();
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
+      // 1. 处理客户端 POST 请求（核心的数据交互）
+      if (req.method === "POST") {
+        try {
+          const body = await req.json();
+          const response = await processMessage(body, apiKey, model);
 
-      sessions.set(sessionId, { id: sessionId, apiKey, writer, model });
+          // 客户端发送的是 notification（如 notifications/initialized），按照规范必须返回 202 且没有 body
+          if (!response) {
+            return new Response(null, {
+              status: 202, // Accepted
+              headers: corsHeaders,
+            });
+          }
 
-      req.signal.addEventListener("abort", () => {
-        writer.close().catch(() => {});
-        sessions.delete(sessionId);
-        console.log(`Session ${sessionId} closed.`);
-      });
-
-      // 必须的 SSE 响应头
-      const headers = {
-        ...corsHeaders,
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      };
-
-      // 核心规范：连接建立后，必须立即推送 event: endpoint，告诉客户端去哪里 POST 数据
-      const endpointUrl = `${url.origin}/mcp/${sessionId}/message`;
-      sendSseEvent(writer, "endpoint", endpointUrl).catch(console.error);
-
-      return new Response(readable, { headers });
-    }
-
-    // 2. 接收客户端消息：POST /mcp/:sessionId/message
-    const msgMatch = path.match(/^\/mcp\/([^/]+)\/message$/);
-    if (msgMatch && req.method === "POST") {
-      const sessionId = msgMatch[1];
-      if (!sessionId) {
-        return new Response("Invalid session ID", {
-          status: 400,
-          headers: corsHeaders,
-        });
-      }
-      const session = sessions.get(sessionId);
-
-      if (!session || !session.writer) {
-        return new Response("Session not found", {
-          status: 404,
-          headers: corsHeaders,
-        });
-      }
-
-      try {
-        const body = await req.json();
-
-        // 解析并生成回复
-        const response = await processMessage(body, session);
-
-        // 核心规范：返回的数据必须通过 SSE 通道发回去，事件类型为 message
-        if (response) {
-          await sendSseEvent(session.writer, "message", response);
+          // 标准 JSON-RPC 请求，直接在 HTTP Body 返回 JSON 结果
+          return new Response(JSON.stringify(response), {
+            status: 200, // OK
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json",
+            },
+          });
+        } catch (err) {
+          console.error("Error processing message:", err);
+          return new Response("Invalid JSON or Processing Error", {
+            status: 400,
+            headers: corsHeaders,
+          });
         }
+      }
 
-        // 核心规范：对于 POST 请求本身，只需返回 HTTP 202 Accepted 即可
-        return new Response("Accepted", {
-          status: 202,
-          headers: corsHeaders,
-        });
-      } catch (err) {
-        console.error("Error processing message:", err);
-        return new Response("Invalid JSON or Processing Error", {
-          status: 400,
+      // 2. 根据 MCP 最新规范，如果客户端尝试通过 GET 建立 SSE 连接，
+      // 但我们的 Server 只支持简单的 Request/Response 模式（无服务端主动推送），
+      // 我们必须明确返回 HTTP 405 Method Not Allowed。
+      if (req.method === "GET") {
+        return new Response("SSE stream not supported at this endpoint", {
+          status: 405, // Method Not Allowed
           headers: corsHeaders,
         });
       }
