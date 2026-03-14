@@ -4,8 +4,7 @@ import { generateText } from "@xsai/generate-text";
 
 const searchTool = {
   name: "search",
-  description:
-    "AI联网搜索",
+  description: "AI联网搜索",
   inputSchema: {
     type: "object",
     properties: {
@@ -36,7 +35,7 @@ export async function handleSearchToolCall(
   const { text } = await generateText({
     apiKey,
     baseURL: "https://api.moonshot.cn/v1",
-    maxSteps: 5,
+    maxSteps: 3,
     messages: [
       {
         content:
@@ -51,32 +50,17 @@ export async function handleSearchToolCall(
     model,
     tools: [
       {
+        // @ts-ignore
+        type: "builtin_function",
+        // @ts-ignore
         function: {
           name: "$web_search",
-          description: "",
-          parameters: {},
         },
-        type: "function",
         execute: (args) => {
           return JSON.stringify(args);
         },
       },
     ],
-    // @todo : 拦截网络请求，后面去掉
-    // @ts-ignore
-    fetch: async (url: string, options: any) => {
-      if (options && options.body) {
-        try {
-          const parsedBody = JSON.parse(options.body);
-          if (parsedBody.tools?.[0]?.type) {
-            parsedBody.tools[0].type = "builtin_function";
-            options.body = JSON.stringify(parsedBody);
-          }
-        } catch (e) {}
-      }
-
-      return fetch(url, options);
-    },
   });
   console.log(`[Tool Call] search returned: "${text}"`);
   return {
