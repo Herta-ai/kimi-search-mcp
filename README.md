@@ -1,5 +1,7 @@
 # Kimi Search MCP
 
+> **[kimi-search-mcp-rs](https://github.com/Herta-ai/kimi-search-mcp-rs)** 使用Rust重构版本，体积更小，占用内存更低。
+
 <p align="center">
   <strong>基于 Kimi AI 的 MCP 联网搜索服务</strong>
 </p>
