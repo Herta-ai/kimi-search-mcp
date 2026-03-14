@@ -207,7 +207,7 @@ kimi-search-mcp/
 
 - [Bun](https://bun.sh) - 高性能 JavaScript 运行时
 - [TypeScript](https://www.typescriptlang.org/) - 类型安全
-- [@xsai/generate-text](https://github.com/nicholasxuu/xsai) - AI 文本生成
+- [xsAI](https://github.com/moeru-ai/xsai) - AI 文本生成
 - [MCP Protocol](https://modelcontextprotocol.io/) - Model Context Protocol
 
 ## 许可证
@@ -217,5 +217,5 @@ kimi-search-mcp/
 ---
 
 <p align="center">
-  Made with ❤️ using <a href="https://bun.sh">Bun</a>
+  Made with ❤️ using <a href="https://bun.sh">Bun</a> and <a href="https://github.com/moeru-ai/xsai">xsAI</a>
 </p>
