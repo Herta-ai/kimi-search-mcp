@@ -121,7 +121,7 @@ bun run dev
 bun run build
 ```
 
-编译后的可执行文件位于 `dist/kimi-search-mcp`
+编译后的可执行文件位于 `dist/web-search-mcp`
 
 ---
 

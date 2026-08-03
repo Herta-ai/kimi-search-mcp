@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "kimi-search-mcp",
+      "name": "web-search-mcp",
       "devDependencies": {
         "@types/bun": "latest",
       },
