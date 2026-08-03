@@ -1,17 +1,45 @@
 import { tools, handleSearchToolCall } from "./tool";
 
-// 提取处理逻辑为纯函数，不再需要维护内存中的 Session 状态
-async function processMessage(message: any, apiKey: string, model: string): Promise<any> {
-  const { method, params, id } = message;
+const PROTOCOL_VERSION = "2026-07-28";
 
-  // 1. 初始化握手
-  if (method === "initialize") {
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name, Authorization",
+  "Access-Control-Expose-Headers":
+    "Mcp-Protocol-Version, Mcp-Method, Mcp-Name",
+};
+
+// 提取处理逻辑为纯函数（MCP 2026-07-28 无状态核心）
+async function processMessage(
+  message: any,
+  apiKey: string,
+  model: string,
+  reqHeaders?: Headers
+): Promise<any> {
+  // 优先读取 JSON-RPC Body 中的 method，若无则从 HTTP Header 获取 (mcp-method)
+  const method = message.method || reqHeaders?.get("mcp-method");
+  const params = message.params || {};
+  const id = message.id ?? null;
+  const _meta = message._meta;
+
+  if (_meta) {
+    console.log(`[MCP Metadata] Received _meta:`, _meta);
+  }
+
+  // 1. 服务发现 RPC (server/discover) 与初始化握手 (initialize 兼容旧客户端)
+  if (method === "server/discover" || method === "initialize") {
     return {
       jsonrpc: "2.0",
       id,
       result: {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: {
+          tools: {
+            listChanged: true,
+          },
+        },
         serverInfo: {
           name: "kimi-search-mcp",
           version: "1.0.0",
@@ -20,12 +48,24 @@ async function processMessage(message: any, apiKey: string, model: string): Prom
     };
   }
 
-  // 2. 客户端通知 (不需要返回值)
+  // 3. 客户端通知 (返回 null，在 HTTP 层按照 202 Accepted 处理)
   if (method === "notifications/initialized") {
-    return null; 
+    return null;
   }
 
-  // 3. 获取工具列表
+  // 4. 统一变更订阅响应流 (subscriptions/listen - 2026-07-28 新增)
+  if (method === "subscriptions/listen") {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        status: "listening",
+        subscriptions: ["toolsListChanged"],
+      },
+    };
+  }
+
+  // 5. 获取工具列表
   if (method === "tools/list") {
     return {
       jsonrpc: "2.0",
@@ -36,13 +76,16 @@ async function processMessage(message: any, apiKey: string, model: string): Prom
     };
   }
 
-  // 4. 调用工具
+  // 6. 调用工具
   if (method === "tools/call") {
-    const { name, arguments: args } = params as {
-      name: string;
-      arguments: Record<string, any> | null;
-    };
+    // 兼容：工具名称可从 params.name 或 HTTP Header "mcp-name" 获取
+    const name = params.name || reqHeaders?.get("mcp-name");
+    const args = params.arguments;
+
     try {
+      if (!name) {
+        throw new Error("Missing tool name in params or Mcp-Name header");
+      }
       if (name !== "search") {
         throw new Error(`Unknown tool: ${name}`);
       }
@@ -66,7 +109,7 @@ async function processMessage(message: any, apiKey: string, model: string): Prom
   return {
     jsonrpc: "2.0",
     id,
-    error: { code: -32601, message: "Method not found" },
+    error: { code: -32601, message: `Method '${method}' not found` },
   };
 }
 
@@ -79,23 +122,17 @@ export const server = Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // 跨域处理 (MCP 规范中要求支持特定 Header)
+    // 跨域 OPTIONS 处理
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
-          "Access-Control-Allow-Origin": "*",
+          ...corsHeaders,
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, MCP-Session-Id, MCP-Protocol-Version",
         },
       });
     }
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, MCP-Session-Id, MCP-Protocol-Version",
-    };
-
-    // --- 核心修改：统一使用 /mcp 端点处理所有事情 ---
+    // 统一使用 /mcp 端点处理
     if (path === "/mcp") {
       const apiKey = url.searchParams.get("apiKey");
       if (!apiKey) {
@@ -106,44 +143,91 @@ export const server = Bun.serve({
       }
       const model = url.searchParams.get("model") || "kimi-k2-0905-preview";
 
-      // 1. 处理客户端 POST 请求（核心的数据交互）
+      // 1. 处理客户端 POST 请求（无状态 Request/Response）
       if (req.method === "POST") {
         try {
-          const body = await req.json();
-          const response = await processMessage(body, apiKey, model);
+          // 读取 2026-07-28 Header 路由信息（req.headers.get 不区分大小写）
+          const headerMethod = req.headers.get("mcp-method");
+          const headerName = req.headers.get("mcp-name");
 
-          // 客户端发送的是 notification（如 notifications/initialized），按照规范必须返回 202 且没有 body
-          if (!response) {
-            return new Response(null, {
-              status: 202, // Accepted
-              headers: corsHeaders,
+          let body: any = {};
+          const textBody = await req.text();
+          if (textBody.trim().length > 0) {
+            body = JSON.parse(textBody);
+          }
+
+          // 如果 Header 中提供了 Mcp-Method，且 Body 中无 method 时使用 Header
+          if (headerMethod && !body.method) {
+            body.method = headerMethod;
+          }
+
+          // 如果 Header 中提供了 Mcp-Name 且 params 中无 name
+          if (headerName) {
+            body.params = body.params || {};
+            if (!body.params.name) {
+              body.params.name = headerName;
+            }
+          }
+
+          // 如果是 subscriptions/listen 请求且客户端请求 SSE 连接流
+          if (
+            body.method === "subscriptions/listen" &&
+            req.headers.get("accept")?.includes("text/event-stream")
+          ) {
+            return new Response("event: ready\ndata: {\"status\":\"listening\"}\n\n", {
+              status: 200,
+              headers: {
+                ...corsHeaders,
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Mcp-Protocol-Version": PROTOCOL_VERSION,
+              },
             });
           }
 
-          // 标准 JSON-RPC 请求，直接在 HTTP Body 返回 JSON 结果
+          const response = await processMessage(body, apiKey, model, req.headers);
+
+          // 客户端发送的是 notification（如 notifications/initialized），按照规范返回 202 无 body
+          if (!response) {
+            return new Response(null, {
+              status: 202,
+              headers: {
+                ...corsHeaders,
+                "Mcp-Protocol-Version": PROTOCOL_VERSION,
+              },
+            });
+          }
+
+          // 标准 JSON-RPC 响应，附带协议版本 Header
           return new Response(JSON.stringify(response), {
-            status: 200, // OK
+            status: 200,
             headers: {
               ...corsHeaders,
               "Content-Type": "application/json",
+              "Mcp-Protocol-Version": PROTOCOL_VERSION,
             },
           });
         } catch (err) {
           console.error("Error processing message:", err);
           return new Response("Invalid JSON or Processing Error", {
             status: 400,
-            headers: corsHeaders,
+            headers: {
+              ...corsHeaders,
+              "Mcp-Protocol-Version": PROTOCOL_VERSION,
+            },
           });
         }
       }
 
-      // 2. 根据 MCP 最新规范，如果客户端尝试通过 GET 建立 SSE 连接，
-      // 但我们的 Server 只支持简单的 Request/Response 模式（无服务端主动推送），
-      // 我们必须明确返回 HTTP 405 Method Not Allowed。
+      // 2. GET 请求提示
       if (req.method === "GET") {
-        return new Response("SSE stream not supported at this endpoint", {
-          status: 405, // Method Not Allowed
-          headers: corsHeaders,
+        return new Response("Subscription stream not supported directly via GET. Use POST for Streamable HTTP.", {
+          status: 405,
+          headers: {
+            ...corsHeaders,
+            "Mcp-Protocol-Version": PROTOCOL_VERSION,
+          },
         });
       }
     }
