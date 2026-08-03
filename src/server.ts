@@ -1,4 +1,4 @@
-import { tools, handleSearchToolCall } from "./tool";
+import { registry } from "./registry";
 
 const PROTOCOL_VERSION = "2026-07-28";
 
@@ -14,8 +14,7 @@ const corsHeaders = {
 // 提取处理逻辑为纯函数（MCP 2026-07-28 无状态核心）
 async function processMessage(
   message: any,
-  apiKey: string,
-  model: string,
+  urlParams: URLSearchParams,
   reqHeaders?: Headers
 ): Promise<any> {
   // 优先读取 JSON-RPC Body 中的 method，若无则从 HTTP Header 获取 (mcp-method)
@@ -41,7 +40,7 @@ async function processMessage(
           },
         },
         serverInfo: {
-          name: "kimi-search-mcp",
+          name: "web-search-mcp",
           version: "1.0.0",
         },
       },
@@ -65,18 +64,18 @@ async function processMessage(
     };
   }
 
-  // 5. 获取工具列表
+  // 5. 获取工具列表 — 动态根据 URL 参数返回
   if (method === "tools/list") {
     return {
       jsonrpc: "2.0",
       id,
       result: {
-        tools,
+        tools: registry.getAvailableTools(urlParams),
       },
     };
   }
 
-  // 6. 调用工具
+  // 6. 调用工具 — 动态分发到对应 Provider
   if (method === "tools/call") {
     // 兼容：工具名称可从 params.name 或 HTTP Header "mcp-name" 获取
     const name = params.name || reqHeaders?.get("mcp-name");
@@ -86,11 +85,18 @@ async function processMessage(
       if (!name) {
         throw new Error("Missing tool name in params or Mcp-Name header");
       }
-      if (name !== "search") {
-        throw new Error(`Unknown tool: ${name}`);
+
+      if (!args?.query) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: "请输入搜索关键词" }],
+          },
+        };
       }
 
-      const result = await handleSearchToolCall(args?.query, apiKey, model);
+      const result = await registry.callTool(name, args.query, urlParams);
       return {
         jsonrpc: "2.0",
         id,
@@ -134,15 +140,6 @@ export const server = Bun.serve({
 
     // 统一使用 /mcp 端点处理
     if (path === "/mcp") {
-      const apiKey = url.searchParams.get("apiKey");
-      if (!apiKey) {
-        return new Response("Missing 'apiKey' query parameter", {
-          status: 400,
-          headers: corsHeaders,
-        });
-      }
-      const model = url.searchParams.get("model") || "kimi-k2-0905-preview";
-
       // 1. 处理客户端 POST 请求（无状态 Request/Response）
       if (req.method === "POST") {
         try {
@@ -186,7 +183,7 @@ export const server = Bun.serve({
             });
           }
 
-          const response = await processMessage(body, apiKey, model, req.headers);
+          const response = await processMessage(body, url.searchParams, req.headers);
 
           // 客户端发送的是 notification（如 notifications/initialized），按照规范返回 202 无 body
           if (!response) {
